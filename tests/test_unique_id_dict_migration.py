@@ -67,3 +67,16 @@ def test_clean_and_foreign_entries_untouched():
     ent_reg = run_migration([clean, switch, other_entry])
     ent_reg.async_update_entity.assert_not_called()
     ent_reg.async_remove.assert_not_called()
+
+
+def test_original_and_dict_twin_resolved_to_original():
+    """Both the orphaned original and the twin are dict-style and map to the
+    same slug — the FIRST-created (original) must win; the twin is removed."""
+    original = make_reg_entry("sensor.solis_inverter_pv_total_energy_generation", OLD_UID)
+    dict_twin = make_reg_entry(
+        "sensor.server_room_solis_inverter_pv_total_energy_generation",
+        OLD_UID.replace("'multiplier': 1}", "'multiplier': 1, 'data_type': <DataType.U32: 'U32'>}"),
+    )
+    ent_reg = run_migration([original, dict_twin])
+    ent_reg.async_remove.assert_called_once_with("sensor.server_room_solis_inverter_pv_total_energy_generation")
+    ent_reg.async_update_entity.assert_called_once_with("sensor.solis_inverter_pv_total_energy_generation", new_unique_id=NEW_UID)

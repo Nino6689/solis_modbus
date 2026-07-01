@@ -123,6 +123,13 @@ def _migrate_dict_style_unique_ids(hass: HomeAssistant, entry: ConfigEntry, cont
     slug_pattern = re.compile(r"'unique': '([^']+)'")
     migrated = 0
 
+    # Group dict-style entries by their target clean uid FIRST. Both the
+    # orphaned original (old dict content) and any twin (new dict content) are
+    # dict-style and map to the same slug — processing them independently would
+    # let the last one steal the uid and delete the first. Registry iteration
+    # preserves creation order, so candidates[0] is the original entry that
+    # owns the user-facing entity_id and history.
+    by_target: dict[tuple, list] = {}
     for reg_entry in list(ent_reg.entities.values()):
         if reg_entry.platform != DOMAIN or reg_entry.config_entry_id != entry.entry_id:
             continue
@@ -132,19 +139,23 @@ def _migrate_dict_style_unique_ids(hass: HomeAssistant, entry: ConfigEntry, cont
         new_uid = unique_id_generator(controller, match.group(1))
         if new_uid == reg_entry.unique_id:
             continue
+        by_target.setdefault((reg_entry.domain, new_uid), []).append(reg_entry)
 
-        twin_entity_id = ent_reg.async_get_entity_id(reg_entry.domain, DOMAIN, new_uid)
-        if twin_entity_id and twin_entity_id != reg_entry.entity_id:
-            # A twin already registered under the clean uid (created while the
-            # dict-style original sat orphaned). The original owns the history
-            # and the user-facing entity_id — drop the twin, keep the original.
-            ent_reg.async_remove(twin_entity_id)
-
+    for (domain, new_uid), candidates in by_target.items():
+        keeper = candidates[0]
+        # Remove later dict-style twins of the same sensor
+        for extra in candidates[1:]:
+            ent_reg.async_remove(extra.entity_id)
+        # Remove any entry already holding the clean uid (a twin registered by
+        # an earlier boot of the fixed code) — the original wins.
+        existing = ent_reg.async_get_entity_id(domain, DOMAIN, new_uid)
+        if existing and existing != keeper.entity_id:
+            ent_reg.async_remove(existing)
         try:
-            ent_reg.async_update_entity(reg_entry.entity_id, new_unique_id=new_uid)
+            ent_reg.async_update_entity(keeper.entity_id, new_unique_id=new_uid)
             migrated += 1
         except ValueError as err:
-            _LOGGER.warning("Could not migrate unique_id for %s: %s", reg_entry.entity_id, err)
+            _LOGGER.warning("Could not migrate unique_id for %s: %s", keeper.entity_id, err)
 
     if migrated:
         _LOGGER.info("Migrated %d sensor unique_ids from dict-style to slug-style", migrated)
