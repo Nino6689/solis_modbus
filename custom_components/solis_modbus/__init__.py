@@ -104,6 +104,52 @@ async def async_setup(hass: HomeAssistant, entry: ConfigEntry):
     return True
 
 
+def _migrate_dict_style_unique_ids(hass: HomeAssistant, entry: ConfigEntry, controller) -> None:
+    """Re-key sensor unique_ids that embedded str(entity definition dict).
+
+    SolisSensorGroup used to pass the whole definition dict to
+    unique_id_generator, baking str(dict) into every sensor unique_id — so any
+    definition change (multiplier, data_type, ...) re-keyed the entity,
+    orphaning its registry entry and spawning a twin. The old unique_id still
+    contains the clean slug as "'unique': '<slug>'", so we can extract it and
+    re-key the ORIGINAL entry (keeping its entity_id + history). If a twin was
+    already created under the clean unique_id, the twin is removed first.
+    """
+    import re
+
+    import homeassistant.helpers.entity_registry as er
+
+    ent_reg = er.async_get(hass)
+    slug_pattern = re.compile(r"'unique': '([^']+)'")
+    migrated = 0
+
+    for reg_entry in list(ent_reg.entities.values()):
+        if reg_entry.platform != DOMAIN or reg_entry.config_entry_id != entry.entry_id:
+            continue
+        match = slug_pattern.search(reg_entry.unique_id)
+        if not match:
+            continue  # already clean (or a different uid scheme: switch/select/time)
+        new_uid = unique_id_generator(controller, match.group(1))
+        if new_uid == reg_entry.unique_id:
+            continue
+
+        twin_entity_id = ent_reg.async_get_entity_id(reg_entry.domain, DOMAIN, new_uid)
+        if twin_entity_id and twin_entity_id != reg_entry.entity_id:
+            # A twin already registered under the clean uid (created while the
+            # dict-style original sat orphaned). The original owns the history
+            # and the user-facing entity_id — drop the twin, keep the original.
+            ent_reg.async_remove(twin_entity_id)
+
+        try:
+            ent_reg.async_update_entity(reg_entry.entity_id, new_unique_id=new_uid)
+            migrated += 1
+        except ValueError as err:
+            _LOGGER.warning("Could not migrate unique_id for %s: %s", reg_entry.entity_id, err)
+
+    if migrated:
+        _LOGGER.info("Migrated %d sensor unique_ids from dict-style to slug-style", migrated)
+
+
 async def _async_reload_on_update(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Reload the entry when its options change.
 
@@ -278,6 +324,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         ]
 
         set_controller(hass, controller, entry)
+
+        # One-shot registry fix-up: re-key dict-style sensor unique_ids to the
+        # clean slugs BEFORE the platforms register their entities.
+        _migrate_dict_style_unique_ids(hass, entry, controller)
 
         _LOGGER.debug(f"Config entry setup for {connection_type} connection: {connection_id}, slave {slave}")
 
